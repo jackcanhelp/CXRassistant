@@ -14,7 +14,7 @@ load_dotenv()
 class CXRAssistantApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CXR X光判讀輔助系統 (動態測量版)")
+        self.root.title("CXR 判讀輔助系統 (Gemini 2.5 Pro 旗艦版)")
         self.root.geometry("1000x700")
         
         self.default_font = ("微軟正黑體", 11)
@@ -23,7 +23,8 @@ class CXRAssistantApp:
         
         # 測量工具的狀態變數
         self.measure_state = 0  # 0: 閒置, 1: 正在量心臟, 2: 正在量胸廓
-        self.measure_pts = []   # 儲存點擊的座標
+        self.start_x = 0
+        self.start_y = 0
 
         self.setup_ui()
 
@@ -40,9 +41,10 @@ class CXRAssistantApp:
         self.canvas = tk.Canvas(self.left_frame, bg="#1e1e1e", cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         
-        # 綁定滑鼠事件
-        self.canvas.bind("<Button-1>", self.on_canvas_click) # 左鍵點擊
-        self.canvas.bind("<Motion>", self.on_canvas_motion)  # 滑鼠移動 (用來畫動態虛線)
+        # 綁定滑鼠拖曳畫線事件
+        self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         
         # 初始提示文字
         self.init_text_id = self.canvas.create_text(
@@ -66,7 +68,7 @@ class CXRAssistantApp:
         self.btn_measure.pack(side=tk.LEFT, padx=5)
         self.btn_measure.config(state=tk.DISABLED)
 
-        self.btn_analyze = tk.Button(self.btn_frame, text="🔍 開始 AI 判讀", font=("微軟正黑體", 12, "bold"), bg="#4CAF50", fg="white", command=self.start_analysis)
+        self.btn_analyze = tk.Button(self.btn_frame, text="🔍 開始 AI 判讀 (2.5 Pro)", font=("微軟正黑體", 12, "bold"), bg="#4CAF50", fg="white", command=self.start_analysis)
         self.btn_analyze.pack(side=tk.RIGHT, padx=5)
         self.btn_analyze.config(state=tk.DISABLED)
 
@@ -141,74 +143,63 @@ class CXRAssistantApp:
             return
         
         self.measure_state = 1
-        self.measure_pts = []
-        self.canvas.delete("measure") # 清除舊的測量線與標記
-        self.canvas.delete("temp_line") # 清除動態虛線
+        self.canvas.delete("measure") 
         
         messagebox.showinfo("CT Ratio 測量 (步驟 1/2)", 
-                            "請在左側 X 光片上，點擊心臟的「最左緣」。\n"
-                            "點擊後移動滑鼠，會拉出一條橘色虛線，接著點擊心臟「最右緣」。")
+                            "請測量【心臟寬度】：\n\n"
+                            "在心臟最左緣「按住」滑鼠左鍵，向右拖曳至心臟最右緣後「放開」。")
 
-    def on_canvas_motion(self, event):
-        """處理滑鼠移動，負責畫出動態虛線"""
+    def on_canvas_press(self, event):
         if self.measure_state == 0:
             return
 
-        # 每次移動前先清除上一條暫存的虛線
-        self.canvas.delete("temp_line")
-
-        # 狀態1且已經點了第1點：正在拉心臟測量線 (橘色虛線)
-        if self.measure_state == 1 and len(self.measure_pts) == 1:
-            p1 = self.measure_pts[0]
-            self.canvas.create_line(p1[0], p1[1], event.x, event.y, 
-                                    fill="orange", width=2, dash=(5, 5), tags="temp_line")
-
-        # 狀態2且已經點了第3點：正在拉胸廓測量線 (綠色虛線)
-        elif self.measure_state == 2 and len(self.measure_pts) == 3:
-            p3 = self.measure_pts[2]
-            # 這裡用亮綠色 (#32CD32 或 #00FF00) 在 X 光黑白底圖上對比度最好
-            self.canvas.create_line(p3[0], p3[1], event.x, event.y, 
-                                    fill="#00FF00", width=2, dash=(5, 5), tags="temp_line")
-
-    def on_canvas_click(self, event):
-        if self.measure_state == 0:
-            return
-
-        x, y = event.x, event.y
-        self.measure_pts.append((x, y))
+        self.start_x, self.start_y = event.x, event.y
+        color = "orange" if self.measure_state == 1 else "#00FF00" 
         
-        # 畫個小圓點提示使用者點擊的精確位置
         r = 3
-        color = "orange" if self.measure_state == 1 else "#00FF00"
-        self.canvas.create_oval(x-r, y-r, x+r, y+r, fill=color, outline=color, tags="measure")
+        self.canvas.create_oval(self.start_x-r, self.start_y-r, self.start_x+r, self.start_y+r, 
+                                fill=color, outline=color, tags="measure_temp")
 
-        # 已經點了兩點 (心臟寬度完成)
-        if self.measure_state == 1 and len(self.measure_pts) == 2:
-            self.canvas.delete("temp_line") # 刪除動態虛線
-            p1, p2 = self.measure_pts[0], self.measure_pts[1]
-            # 畫心臟橘色實線
-            self.canvas.create_line(p1[0], p1[1], p2[0], p2[1], fill="orange", width=2, tags="measure")
-            self.heart_width = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+    def on_canvas_drag(self, event):
+        if self.measure_state == 0:
+            return
             
+        color = "orange" if self.measure_state == 1 else "#00FF00"
+        self.canvas.delete("measure_preview")
+        self.canvas.create_line(self.start_x, self.start_y, event.x, event.y, 
+                                fill=color, width=2, dash=(5, 5), tags="measure_preview")
+
+    def on_canvas_release(self, event):
+        if self.measure_state == 0:
+            return
+
+        end_x, end_y = event.x, event.y
+        dist = math.hypot(end_x - self.start_x, end_y - self.start_y)
+        self.canvas.delete("measure_temp", "measure_preview")
+        
+        if dist < 5:
+            return
+
+        color = "orange" if self.measure_state == 1 else "#00FF00"
+        r = 3
+        
+        self.canvas.create_oval(self.start_x-r, self.start_y-r, self.start_x+r, self.start_y+r, fill=color, outline=color, tags="measure")
+        self.canvas.create_line(self.start_x, self.start_y, end_x, end_y, fill=color, width=2, dash=(5, 5), tags="measure")
+        self.canvas.create_oval(end_x-r, end_y-r, end_x+r, end_y+r, fill=color, outline=color, tags="measure")
+
+        if self.measure_state == 1:
+            self.heart_width = dist
             self.measure_state = 2
             messagebox.showinfo("CT Ratio 測量 (步驟 2/2)", 
                                 "心臟寬度已記錄。\n\n"
-                                "請接著點擊胸廓的「最左側內緣」。\n"
-                                "點擊後移動滑鼠拉出綠色虛線，再點擊「最右側內緣」。")
+                                "請繼續測量【胸廓寬度】：\n"
+                                "在胸廓左側內緣「按住」滑鼠左鍵，向右拖曳至右側內緣後「放開」。")
 
-        # 已經點了四點 (胸廓寬度完成)
-        elif self.measure_state == 2 and len(self.measure_pts) == 4:
-            self.canvas.delete("temp_line") # 刪除動態虛線
-            p3, p4 = self.measure_pts[2], self.measure_pts[3]
-            # 畫胸廓綠色實線
-            self.canvas.create_line(p3[0], p3[1], p4[0], p4[1], fill="#00FF00", width=2, tags="measure")
-            self.thorax_width = math.hypot(p4[0]-p3[0], p4[1]-p3[1])
-            
-            # 計算比例
+        elif self.measure_state == 2:
+            self.thorax_width = dist
             ct_ratio = self.heart_width / self.thorax_width
-            self.measure_state = 0 # 結束測量模式
+            self.measure_state = 0
             
-            # 顯示結果
             result_msg = f"測量完成！\n\nCardiothoracic (CT) Ratio = {ct_ratio:.3f}"
             if ct_ratio > 0.5:
                 result_msg += "\n\n⚠️ 結果大於 0.5，提示可能有心室肥大 (Cardiomegaly) 跡象。"
@@ -216,8 +207,6 @@ class CXRAssistantApp:
                 result_msg += "\n\n✅ 結果小於 0.5，心臟大小在正常範圍內。"
             
             messagebox.showinfo("測量結果", result_msg)
-            
-            # 將結果附加到報告區
             self.report_text.insert(tk.END, f"\n[手動測量結果] CT Ratio: {ct_ratio:.3f}\n")
             self.btn_export.config(state=tk.NORMAL)
 
@@ -228,13 +217,13 @@ class CXRAssistantApp:
             
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            messagebox.showerror("錯誤", "找不到 API Key！\n請確定程式同目錄下有 .env 檔案，且內容包含 GEMINI_API_KEY=你的金鑰。")
+            messagebox.showerror("錯誤", "找不到 API Key！\n請確定程式同目錄下有 .env 檔案。")
             return
 
         self.btn_analyze.config(state=tk.DISABLED, text="⏳ AI 判讀中...")
         self.btn_export.config(state=tk.DISABLED)
         self.report_text.delete(1.0, tk.END)
-        self.report_text.insert(tk.END, "正在自動探索可用模型並分析影像...\n這可能需要幾秒鐘，請稍候...")
+        self.report_text.insert(tk.END, "正在使用 Gemini 2.5 進行高精度病灶掃描...\n請稍候...")
         
         threading.Thread(target=self._real_ai_analysis_process, args=(api_key,), daemon=True).start()
 
@@ -242,6 +231,13 @@ class CXRAssistantApp:
         try:
             genai.configure(api_key=api_key)
             
+            # 【升級】使用最新的 gemini-2.5-pro 作為首選旗艦模型
+            models_to_try = [
+                'gemini-2.5-pro',
+                'gemini-2.5-flash'
+            ]
+            
+            # 專攻腫瘤與微小病灶的 Prompt
             prompt = """
             你現在是一位大型醫學中心的「胸腔腫瘤專科」資深放射科主治醫師 (Attending Thoracic Radiologist)。
             請根據提供的胸部 X 光片 (CXR)，撰寫一份極度精簡、專業的影像判讀報告。
@@ -272,72 +268,34 @@ class CXRAssistantApp:
             - Bones & Soft Tissues: (精簡描述，若正常填 Unremarkable)
 
             [IMPRESSION]
-            1. (最可能的診斷，若有疑似腫瘤請列為第一點並建議 CT)
+            1. (最可能的診斷，若有疑似腫瘤請列為第一點並強烈建議 Chest CT)
             2. (鑑別診斷 2，若無則免)
             """
             
-            # 【終極防呆機制】全自動模型巡迴測試
-            models_to_try = [
-                'gemini-1.5-pro',
-                'gemini-1.5-pro-latest',
-                'gemini-1.5-flash',
-                'gemini-1.5-flash-latest',
-                'gemini-pro-vision', # 舊版但穩定的視覺模型
-                'gemini-2.0-flash'   # 預防未來的模型名稱變更
-            ]
-            
             report_content = None
-            last_error = ""
             successful_model = ""
+            last_error = ""
 
-            # 階段 1：嘗試常規清單
+            # 嘗試 2.5 系列模型
             for model_name in models_to_try:
                 try:
-                    print(f"嘗試使用模型: {model_name}...")
                     model = genai.GenerativeModel(model_name)
                     response = model.generate_content([prompt, self.current_image])
                     report_content = response.text
                     successful_model = model_name
-                    print(f"成功使用模型: {successful_model}")
-                    break # 成功取得回應，跳出迴圈
+                    break 
                 except Exception as e:
                     last_error = str(e)
-                    print(f"模型 {model_name} 失敗: {last_error}")
                     continue
             
-            # 階段 2：如果常規清單全滅，直接詢問 API 可用的清單並逐一測試
             if report_content is None:
-                try:
-                    print("常規清單皆失敗，嘗試動態搜尋可用模型...")
-                    for m in genai.list_models():
-                        if 'generateContent' in m.supported_generation_methods:
-                            model_name = m.name.replace('models/', '')
-                            # 只測試名稱中包含這些關鍵字的模型，避免測到純文字模型報錯
-                            if any(kw in model_name for kw in ['vision', '1.5', '2.0', '2.5']):
-                                print(f"嘗試動態模型: {model_name}...")
-                                try:
-                                    model = genai.GenerativeModel(model_name)
-                                    response = model.generate_content([prompt, self.current_image])
-                                    report_content = response.text
-                                    successful_model = model_name
-                                    print(f"動態搜尋成功使用模型: {successful_model}")
-                                    break
-                                except Exception as inner_err:
-                                    print(f"動態模型 {model_name} 失敗: {str(inner_err)}")
-                                    continue
-                except Exception as fetch_err:
-                    last_error += f"\n動態搜尋也失敗: {str(fetch_err)}"
-
-            # 最終結果判定
-            if report_content is None:
-                report_content = f"❌ AI 判讀發生致命錯誤，已嘗試所有可用模型皆失敗：\n\n{last_error}\n\n(請檢查網路連線，或您的 API Key 可能沒有視覺模型存取權限)"
-            elif successful_model != 'gemini-1.5-pro':
-                report_content = f"⚠️ [系統提示] 因權限限制，已自動尋找並切換至可用模型：{successful_model}\n\n" + report_content
+                report_content = f"❌ AI 判讀發生致命錯誤，2.5 系列模型無法存取：\n\n{last_error}\n\n(請確認 API Key 權限與連線)"
+            elif successful_model != 'gemini-2.5-pro':
+                report_content = f"⚠️ [系統提示] 無法呼叫 Pro，已使用高速版 {successful_model} 完成判讀。\n\n" + report_content
             
         except Exception as e:
             report_content = f"❌ 系統發生預期外錯誤：\n\n{str(e)}"
 
-        # 確保回到主執行緒更新 UI
         self.root.after(0, self._update_report_ui, report_content)
 
     def _update_report_ui(self, report_content):
@@ -351,7 +309,7 @@ class CXRAssistantApp:
                 self.report_text.insert(tk.END, m + "\n")
 
         self.btn_analyze.config(state=tk.NORMAL, text="🔍 重新判讀")
-        if "❌ AI 判讀發生致命錯誤" not in report_content and "❌ 系統發生預期外錯誤" not in report_content:
+        if "❌" not in report_content:
             self.btn_export.config(state=tk.NORMAL)
 
     def export_report(self):
