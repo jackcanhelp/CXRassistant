@@ -234,26 +234,32 @@ class CXRAssistantApp:
         self.btn_analyze.config(state=tk.DISABLED, text="⏳ AI 判讀中...")
         self.btn_export.config(state=tk.DISABLED)
         self.report_text.delete(1.0, tk.END)
-        self.report_text.insert(tk.END, "正在呼叫 Gemini 視覺模型分析影像...\n請稍候...")
+        self.report_text.insert(tk.END, "正在自動探索可用模型並分析影像...\n這可能需要幾秒鐘，請稍候...")
         
         threading.Thread(target=self._real_ai_analysis_process, args=(api_key,), daemon=True).start()
 
     def _real_ai_analysis_process(self, api_key):
         try:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.5-flash')
             
             prompt = """
-            你現在是一位大型醫學中心的資深放射科主治醫師 (Attending Radiologist)。
-            請根據提供的胸部 X 光片 (CXR)，撰寫一份極度精簡、專業且符合臨床常態的影像判讀報告。
+            你現在是一位大型醫學中心的「胸腔腫瘤專科」資深放射科主治醫師 (Attending Thoracic Radiologist)。
+            請根據提供的胸部 X 光片 (CXR)，撰寫一份極度精簡、專業的影像判讀報告。
+
+            【強制檢索指令 (Search Pattern)】：
+            在輸出報告前，請務必先仔細檢視以下容易隱藏肺癌 (Lung Cancer/Nodule/Mass) 的高風險盲區：
+            1. 肺尖 (Apices) 與鎖骨交疊處
+            2. 肺門區 (Hilar regions) 是否不對稱或增厚
+            3. 心臟後方 (Retrocardiac area)
+            4. 橫膈膜下方與肋膈角
+            5. 骨骼是否有侵蝕 (Bone destruction)
+            仔細尋找任何邊界不清、有毛刺感 (Spiculated)、或異常的高密度陰影。
 
             【嚴格寫作規範】：
-            1. 語氣：電報式 (Telegraphic style)，簡明扼要，絕不講廢話。
-            2. 正常部位：若構造正常，只需寫 "Unremarkable" 或 "Normal"，不要解釋原因。
-            3. 客觀與主觀分離：
-               - [FINDINGS] 區塊：只能客觀描述異常影像特徵（位置、形狀、密度）。
-               - [IMPRESSION] 區塊：給出最可能的 1~3 個臨床診斷。
-            4. 語言：以醫學英文為主，輔以繁體中文說明（台灣醫院常見的報告格式）。
+            1. 語氣：電報式 (Telegraphic style)，簡明扼要。
+            2. 正常部位：若構造正常，只需寫 "Unremarkable"，不解釋原因。
+            3. 若發現疑似病灶，請具體描述其「位置 (如 RUL, LLL)」、「大小估計」、「邊界特徵 (如 well-defined, ill-defined)」。
+            4. 語言：以醫學英文為主，輔以繁體中文說明。
 
             請嚴格輸出以下格式：
 
@@ -261,21 +267,77 @@ class CXRAssistantApp:
             (若無特殊狀況填 Routine)
 
             [FINDINGS]
-            - Lungs & Pleura: (精簡描述異常，正常填 Unremarkable)
-            - Heart & Mediastinum: (精簡描述異常，正常填 Unremarkable)
-            - Bones & Soft Tissues: (精簡描述異常，正常填 Unremarkable)
+            - Lungs & Pleura: (精簡描述異常，若無病灶填 Unremarkable)
+            - Heart & Mediastinum: (精簡描述，若正常填 Unremarkable)
+            - Bones & Soft Tissues: (精簡描述，若正常填 Unremarkable)
 
             [IMPRESSION]
-            1. (最可能的診斷 1)
+            1. (最可能的診斷，若有疑似腫瘤請列為第一點並建議 CT)
             2. (鑑別診斷 2，若無則免)
             """
             
-            response = model.generate_content([prompt, self.current_image])
-            report_content = response.text
+            # 【終極防呆機制】全自動模型巡迴測試
+            models_to_try = [
+                'gemini-1.5-pro',
+                'gemini-1.5-pro-latest',
+                'gemini-1.5-flash',
+                'gemini-1.5-flash-latest',
+                'gemini-pro-vision', # 舊版但穩定的視覺模型
+                'gemini-2.0-flash'   # 預防未來的模型名稱變更
+            ]
+            
+            report_content = None
+            last_error = ""
+            successful_model = ""
+
+            # 階段 1：嘗試常規清單
+            for model_name in models_to_try:
+                try:
+                    print(f"嘗試使用模型: {model_name}...")
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content([prompt, self.current_image])
+                    report_content = response.text
+                    successful_model = model_name
+                    print(f"成功使用模型: {successful_model}")
+                    break # 成功取得回應，跳出迴圈
+                except Exception as e:
+                    last_error = str(e)
+                    print(f"模型 {model_name} 失敗: {last_error}")
+                    continue
+            
+            # 階段 2：如果常規清單全滅，直接詢問 API 可用的清單並逐一測試
+            if report_content is None:
+                try:
+                    print("常規清單皆失敗，嘗試動態搜尋可用模型...")
+                    for m in genai.list_models():
+                        if 'generateContent' in m.supported_generation_methods:
+                            model_name = m.name.replace('models/', '')
+                            # 只測試名稱中包含這些關鍵字的模型，避免測到純文字模型報錯
+                            if any(kw in model_name for kw in ['vision', '1.5', '2.0', '2.5']):
+                                print(f"嘗試動態模型: {model_name}...")
+                                try:
+                                    model = genai.GenerativeModel(model_name)
+                                    response = model.generate_content([prompt, self.current_image])
+                                    report_content = response.text
+                                    successful_model = model_name
+                                    print(f"動態搜尋成功使用模型: {successful_model}")
+                                    break
+                                except Exception as inner_err:
+                                    print(f"動態模型 {model_name} 失敗: {str(inner_err)}")
+                                    continue
+                except Exception as fetch_err:
+                    last_error += f"\n動態搜尋也失敗: {str(fetch_err)}"
+
+            # 最終結果判定
+            if report_content is None:
+                report_content = f"❌ AI 判讀發生致命錯誤，已嘗試所有可用模型皆失敗：\n\n{last_error}\n\n(請檢查網路連線，或您的 API Key 可能沒有視覺模型存取權限)"
+            elif successful_model != 'gemini-1.5-pro':
+                report_content = f"⚠️ [系統提示] 因權限限制，已自動尋找並切換至可用模型：{successful_model}\n\n" + report_content
             
         except Exception as e:
-            report_content = f"❌ AI 判讀發生錯誤：\n\n{str(e)}\n\n(請檢查網路連線或 API Key)"
+            report_content = f"❌ 系統發生預期外錯誤：\n\n{str(e)}"
 
+        # 確保回到主執行緒更新 UI
         self.root.after(0, self._update_report_ui, report_content)
 
     def _update_report_ui(self, report_content):
@@ -289,7 +351,7 @@ class CXRAssistantApp:
                 self.report_text.insert(tk.END, m + "\n")
 
         self.btn_analyze.config(state=tk.NORMAL, text="🔍 重新判讀")
-        if "❌ AI 判讀發生錯誤" not in report_content:
+        if "❌ AI 判讀發生致命錯誤" not in report_content and "❌ 系統發生預期外錯誤" not in report_content:
             self.btn_export.config(state=tk.NORMAL)
 
     def export_report(self):
