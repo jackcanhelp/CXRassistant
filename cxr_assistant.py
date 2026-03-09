@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
-from PIL import Image, ImageTk, ImageGrab
+from PIL import Image, ImageTk, ImageGrab, ImageOps, ImageEnhance, ImageFilter
 import threading
 import os
 import math
@@ -25,6 +25,12 @@ class CXRAssistantApp:
         self.measure_state = 0  # 0: 閒置, 1: 正在量心臟, 2: 正在量胸廓
         self.start_x = 0
         self.start_y = 0
+
+        self.invert_var     = tk.BooleanVar(value=False)
+        self.brightness_var = tk.IntVar(value=100)
+        self.contrast_var   = tk.IntVar(value=100)
+        self.sharpness_var  = tk.IntVar(value=100)
+        self.edge_var       = tk.IntVar(value=0)
 
         self.setup_ui()
 
@@ -72,6 +78,61 @@ class CXRAssistantApp:
         self.btn_analyze.pack(side=tk.RIGHT, padx=5)
         self.btn_analyze.config(state=tk.DISABLED)
 
+        # 影像選項列
+        self.options_frame = tk.Frame(self.right_frame)
+        self.options_frame.pack(fill=tk.X, pady=(0, 6))
+        tk.Checkbutton(
+            self.options_frame, text="🦴 黑白反向顯示（Bone lesion 模式）",
+            variable=self.invert_var, font=("微軟正黑體", 9),
+            command=self._render_canvas
+        ).pack(side=tk.LEFT)
+
+        # ── 影像調整滑桿區 ──
+        adj_frame = tk.LabelFrame(self.right_frame, text="影像調整（即時預覽，AI 判讀時同步套用）",
+                                   font=("微軟正黑體", 9), fg="#333333")
+        adj_frame.pack(fill=tk.X, pady=(0, 6))
+
+        sliders = [
+            ("亮度",   self.brightness_var,  50, 200),
+            ("對比",   self.contrast_var,    50, 300),
+            ("銳化",   self.sharpness_var,    0, 500),
+            ("邊緣增強", self.edge_var,        0, 200),
+        ]
+        self._slider_val_labels = {}
+        for col, (name, var, lo, hi) in enumerate(sliders):
+            cell = tk.Frame(adj_frame)
+            cell.grid(row=0, column=col, padx=6, pady=4, sticky="ew")
+            adj_frame.columnconfigure(col, weight=1)
+
+            tk.Label(cell, text=name, font=("微軟正黑體", 8)).pack(anchor="w")
+            val_label = tk.Label(cell, text=str(var.get()), font=("微軟正黑體", 8), width=4, anchor="e")
+            val_label.pack(side=tk.RIGHT)
+            self._slider_val_labels[name] = val_label
+
+            def make_cmd(v=var, lbl=val_label):
+                def cmd(*_):
+                    lbl.config(text=str(v.get()))
+                    self._render_canvas()
+                return cmd
+
+            tk.Scale(cell, variable=var, from_=lo, to=hi, orient=tk.HORIZONTAL,
+                     showvalue=False, length=90, command=make_cmd()
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # 重置按鈕
+        def reset_sliders():
+            self.brightness_var.set(100)
+            self.contrast_var.set(100)
+            self.sharpness_var.set(100)
+            self.edge_var.set(0)
+            for name, lbl in self._slider_val_labels.items():
+                val = {"亮度": 100, "對比": 100, "銳化": 100, "邊緣增強": 0}[name]
+                lbl.config(text=str(val))
+            self._render_canvas()
+
+        tk.Button(adj_frame, text="重置", font=("微軟正黑體", 8), command=reset_sliders
+                  ).grid(row=1, column=3, padx=6, pady=(0, 4), sticky="e")
+
         # 報告顯示與匯出區
         self.report_header_frame = tk.Frame(self.right_frame)
         self.report_header_frame.pack(fill=tk.X, pady=(5, 0))
@@ -111,30 +172,60 @@ class CXRAssistantApp:
         except Exception as e:
             messagebox.showerror("錯誤", f"無法從剪貼簿讀取:\n{str(e)}")
 
-    def display_image(self, img):
-        self.current_image = img.copy()
-        
+    def _get_processed_image(self):
+        """套用所有滑桿與反轉設定，回傳處理後的 PIL Image（原圖不變）。"""
+        if self.current_image is None:
+            return None
+        img = self.current_image.copy()
+        if self.invert_var.get():
+            img = ImageOps.invert(img)
+        img = ImageEnhance.Brightness(img).enhance(self.brightness_var.get() / 100)
+        img = ImageEnhance.Contrast(img).enhance(self.contrast_var.get() / 100)
+        img = ImageEnhance.Sharpness(img).enhance(self.sharpness_var.get() / 100)
+        edge_val = self.edge_var.get()
+        if edge_val > 0:
+            img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=edge_val, threshold=2))
+        return img
+
+    def _render_canvas(self, *_):
+        """將處理後影像渲染至 canvas。"""
+        img_thumb = self._get_processed_image()
+        if img_thumb is None:
+            return
         self.canvas.update()
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
-        
-        if canvas_width < 10: 
+        if canvas_width < 10:
             canvas_width, canvas_height = 430, 500
 
-        img_thumb = img.copy()
         img_thumb.thumbnail((canvas_width, canvas_height), Image.Resampling.LANCZOS)
-        
         self.current_photo = ImageTk.PhotoImage(img_thumb)
-        
+        self.canvas.delete("cxr_image")
+        self.canvas.create_image(canvas_width // 2, canvas_height // 2,
+                                  image=self.current_photo, anchor=tk.CENTER,
+                                  tags="cxr_image")
+        self.canvas.tag_lower("cxr_image")
+
+    def display_image(self, img):
+        self.current_image = img.copy()
+        # 載入新圖：重置所有調整
+        self.invert_var.set(False)
+        self.brightness_var.set(100)
+        self.contrast_var.set(100)
+        self.sharpness_var.set(100)
+        self.edge_var.set(0)
+        for name, lbl in self._slider_val_labels.items():
+            lbl.config(text=str({"亮度": 100, "對比": 100, "銳化": 100, "邊緣增強": 0}[name]))
+
         self.canvas.delete("all")
-        self.canvas.create_image(canvas_width//2, canvas_height//2, image=self.current_photo, anchor=tk.CENTER)
-        
+        self._render_canvas()
+
         self.btn_analyze.config(state=tk.NORMAL)
         self.btn_measure.config(state=tk.NORMAL)
         self.btn_export.config(state=tk.DISABLED)
         self.report_text.delete(1.0, tk.END)
         self.report_text.insert(tk.END, "✅ 影像載入成功。\n您可以點擊上方按鈕進行 AI 判讀，或手動測量 CT Ratio。\n")
-        
+
         self.measure_state = 0
 
     # --- CT Ratio 測量邏輯 ---
@@ -224,10 +315,11 @@ class CXRAssistantApp:
         self.btn_export.config(state=tk.DISABLED)
         self.report_text.delete(1.0, tk.END)
         self.report_text.insert(tk.END, "正在使用 Gemini 2.5 進行高精度病灶掃描...\n請稍候...")
-        
-        threading.Thread(target=self._real_ai_analysis_process, args=(api_key,), daemon=True).start()
 
-    def _real_ai_analysis_process(self, api_key):
+        img_to_send = self._get_processed_image()  # 在主執行緒取得處理後影像
+        threading.Thread(target=self._real_ai_analysis_process, args=(api_key, img_to_send), daemon=True).start()
+
+    def _real_ai_analysis_process(self, api_key, img_to_send):
         try:
             genai.configure(api_key=api_key)
             
@@ -280,7 +372,7 @@ class CXRAssistantApp:
             for model_name in models_to_try:
                 try:
                     model = genai.GenerativeModel(model_name)
-                    response = model.generate_content([prompt, self.current_image])
+                    response = model.generate_content([prompt, img_to_send])
                     report_content = response.text
                     successful_model = model_name
                     break 
