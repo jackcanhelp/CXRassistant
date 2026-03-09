@@ -8,6 +8,14 @@ from datetime import datetime
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+# CLAHE 需要 numpy + skimage；未安裝時自動降級為 PIL equalize
+try:
+    import numpy as np
+    from skimage.exposure import equalize_adapthist
+    _CLAHE_AVAILABLE = True
+except ImportError:
+    _CLAHE_AVAILABLE = False
+
 # 載入 .env 檔案中的環境變數
 load_dotenv()
 
@@ -26,7 +34,8 @@ class CXRAssistantApp:
         self.start_x = 0
         self.start_y = 0
 
-        self.invert_var     = tk.BooleanVar(value=False)
+        self.invert_var          = tk.BooleanVar(value=False)
+        self.tumor_enhance_var   = tk.BooleanVar(value=False)
         self.brightness_var = tk.IntVar(value=100)
         self.contrast_var   = tk.IntVar(value=100)
         self.sharpness_var  = tk.IntVar(value=100)
@@ -86,6 +95,13 @@ class CXRAssistantApp:
             variable=self.invert_var, font=("微軟正黑體", 9),
             command=self._render_canvas
         ).pack(side=tk.LEFT)
+
+        tk.Checkbutton(
+            self.options_frame,
+            text="🔬 腫瘤偵測增強（CLAHE + Autocontrast + Unsharp Mask）",
+            variable=self.tumor_enhance_var, font=("微軟正黑體", 9),
+            fg="#007700", command=self._render_canvas
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         # ── 影像調整滑桿區 ──
         adj_frame = tk.LabelFrame(self.right_frame, text="影像調整（即時預覽，AI 判讀時同步套用）",
@@ -172,6 +188,33 @@ class CXRAssistantApp:
         except Exception as e:
             messagebox.showerror("錯誤", f"無法從剪貼簿讀取:\n{str(e)}")
 
+    def _clahe_enhance(self, img, clip_limit=0.03):
+        """
+        自適應局部直方圖均衡（CLAHE）。
+        skimage 可用時使用真正的 CLAHE；否則以 PIL equalize 混合替代。
+        兩者都與原圖 60/40 混合，避免過度均衡導致細節流失。
+        """
+        if _CLAHE_AVAILABLE:
+            arr = np.array(img.convert('L')).astype(np.float64) / 255.0
+            clahe_arr = equalize_adapthist(arr, clip_limit=clip_limit)
+            clahe_img = Image.fromarray((clahe_arr * 255).astype(np.uint8)).convert('RGB')
+        else:
+            clahe_img = ImageOps.equalize(img)
+        return Image.blend(img, clahe_img, alpha=0.6)
+
+    def _apply_tumor_enhancement(self, img):
+        """
+        腫瘤偵測增強 pipeline（文獻實證最佳組合）：
+          1. CLAHE          → 拉開心臟陰影、肺尖等暗區的密度層次
+          2. Autocontrast   → 最大化整張影像動態範圍
+          3. Unsharp Mask   → 突顯 2–8 cm mass 的局部密度隆起與邊緣
+        手動滑桿在此 pipeline 之後疊加，讓使用者微調。
+        """
+        img = self._clahe_enhance(img, clip_limit=0.03)
+        img = ImageOps.autocontrast(img, cutoff=0.5)
+        img = img.filter(ImageFilter.UnsharpMask(radius=5, percent=150, threshold=2))
+        return img
+
     def _get_processed_image(self):
         """套用所有滑桿與反轉設定，回傳處理後的 PIL Image（原圖不變）。"""
         if self.current_image is None:
@@ -179,6 +222,9 @@ class CXRAssistantApp:
         img = self.current_image.copy()
         if self.invert_var.get():
             img = ImageOps.invert(img)
+        # 腫瘤增強 pipeline（在手動滑桿前套用）
+        if self.tumor_enhance_var.get():
+            img = self._apply_tumor_enhancement(img)
         img = ImageEnhance.Brightness(img).enhance(self.brightness_var.get() / 100)
         img = ImageEnhance.Contrast(img).enhance(self.contrast_var.get() / 100)
         img = ImageEnhance.Sharpness(img).enhance(self.sharpness_var.get() / 100)
@@ -210,6 +256,7 @@ class CXRAssistantApp:
         self.current_image = img.copy()
         # 載入新圖：重置所有調整
         self.invert_var.set(False)
+        self.tumor_enhance_var.set(False)
         self.brightness_var.set(100)
         self.contrast_var.set(100)
         self.sharpness_var.set(100)
